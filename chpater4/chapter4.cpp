@@ -1,3 +1,4 @@
+#include "../include/KaleidoscopeJIT.h"
 #include "llvm/ADT/APFloat.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/IR/BasicBlock.h"
@@ -6,19 +7,28 @@
 #include "llvm/IR/Function.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/LLVMContext.h"
+#include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Type.h"
 #include "llvm/IR/Verifier.h"
+#include "llvm/Support/TargetSelect.h"
+#include "llvm/Target/TargetMachine.h"
+#include "llvm/Transforms/InstCombine/InstCombine.h"
+#include "llvm/Transforms/Scalar.h"
+#include "llvm/Transforms/Scalar/GVN.h"
+#include <algorithm>
+#include <cassert>
 #include <cctype>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <map>
 #include <memory>
 #include <string>
-#include <utility>
 #include <vector>
 
 using namespace llvm;
+using namespace llvm::orc;
 
 enum Token 
 {
@@ -379,10 +389,28 @@ static std::unique_ptr<Module> the_module;
 static std::unique_ptr<IRBuilder<>> builder;
 static std::map<std::string, Value*> named_values;
 
+static std::unique_ptr<legacy::FunctionPassManager> the_fpm;
+static std::unique_ptr<KaleidoscopeJIT> the_jit;
+static std::map<std::string, std::unique_ptr<PrototypeAST>> function_protos;
+static ExitOnError exit_on_error;
+
+
 Value *log_error_v(const char *message)
 {
     log_error(message);
 
+    return nullptr;
+}
+
+Function *get_function(std::string name)
+{
+    if(auto *f = the_module->getFunction(name))
+        return f;
+
+    auto fi = function_protos.find(name);
+    if(fi != function_protos.end())
+        return fi->second->codegen();
+    
     return nullptr;
 }
 
@@ -428,7 +456,7 @@ Value *BinaryExprAST::codegen()
 
 Value *CallExprAST::codegen()
 {
-    Function *callee_f = the_module->getFunction(callee);
+    Function *callee_f = get_function(callee);
 
     if(!callee_f)
         return log_error_v("unknown function referenced");
@@ -451,8 +479,7 @@ Value *CallExprAST::codegen()
 Function *PrototypeAST::codegen() 
 {
     std::vector<Type *> Doubles(args.size(), Type::getDoubleTy(*the_context));
-    FunctionType *ft =
-        FunctionType::get(Type::getDoubleTy(*the_context), Doubles, false);
+    FunctionType *ft = FunctionType::get(Type::getDoubleTy(*the_context), Doubles, false);
 
     Function *f = Function::Create(ft, Function::ExternalLinkage, name, the_module.get());
 
@@ -465,10 +492,10 @@ Function *PrototypeAST::codegen()
 
 Function *FunctionAST::codegen() 
 {    
-    Function *the_function = the_module->getFunction(proto->getName());
+    auto &p = *proto;
+    function_protos[proto->getName()] = std::move(proto);
 
-    if (!the_function)
-        the_function = proto->codegen();
+    Function *the_function = get_function(p.getName());
 
     if (!the_function)
         return nullptr;
@@ -486,6 +513,8 @@ Function *FunctionAST::codegen()
 
         verifyFunction(*the_function);
 
+        the_fpm->run(*the_function);
+
         return the_function;
     }
 
@@ -493,12 +522,22 @@ Function *FunctionAST::codegen()
     return nullptr;
 }
 
-static void initialize_module()
+static void initialize_module_and_pass_manager()
 {
     the_context = std::make_unique<LLVMContext>();
     the_module = std::make_unique<Module>("my cool jit", *the_context);
+    the_module->setDataLayout(the_jit->getDataLayout());
 
     builder = std::make_unique<IRBuilder<>>(*the_context);
+
+    the_fpm = std::make_unique<legacy::FunctionPassManager>(the_module.get());
+
+    the_fpm->add(createInstructionCombiningPass()); // peephole
+    the_fpm->add(createReassociatePass());          // reassociate expression
+    the_fpm->add(createGVNPass());                  // eliminate common subexpression
+    the_fpm->add(createCFGSimplificationPass());    // control flow graph
+
+    the_fpm->doInitialization();
 }
 
 static void handle_definition() 
@@ -512,6 +551,9 @@ static void handle_definition()
             fn_ir->print(errs());
 
             fprintf(stderr, "\n");
+
+            exit_on_error(the_jit->addModule(ThreadSafeModule(std::move(the_module), std::move(the_context))));
+            initialize_module_and_pass_manager();
         }
     }
     else 
@@ -531,6 +573,8 @@ static void handle_extern()
             fn_ir->print(errs());
 
             fprintf(stderr, "\n");
+
+            function_protos[proto_ast->getName()] = std::move(proto_ast);
         }
     }
     else 
@@ -543,15 +587,21 @@ static void handle_top_level_expression()
 {
     if(auto fn_ast = parse_top_level_expr())
     {
-        if(auto *fn_ir = fn_ast->codegen())
+        if(fn_ast->codegen())
         {
-            fprintf(stderr, "read top-level expression:");
+            auto rt = the_jit->getMainJITDylib().createResourceTracker();
 
-            fn_ir->print(errs());
+            auto tsm = ThreadSafeModule(std::move(the_module), std::move(the_context));
+            exit_on_error(the_jit->addModule(std::move(tsm), rt));
+            initialize_module_and_pass_manager();
 
-            fprintf(stderr, "\n");
+            auto expr_symbol = exit_on_error(the_jit->lookup("__anon_expr"));
+            
+            double (*fp)() = (double (*)())(intptr_t)expr_symbol.getAddress();
 
-            fn_ir->eraseFromParent();
+            fprintf(stderr, "evaluated to %f\n", fp());
+            
+            exit_on_error(rt->remove());
         }
     }
     else 
@@ -586,8 +636,30 @@ static void main_loop()
     }
 }
 
+#ifdef _WIN32
+#define DLLEXPORT __declspec(dllexport)
+#else
+#define DLLEXPORT
+#endif
+
+extern "C" DLLEXPORT double putchard(double x) 
+{
+  fputc((char)x, stderr);
+  return 0;
+}
+
+extern "C" DLLEXPORT double printd(double x) 
+{
+  fprintf(stderr, "%f\n", x);
+  return 0;
+}
+
 int main()
 {
+    InitializeNativeTarget();
+    InitializeNativeTargetAsmPrinter();
+    InitializeNativeTargetAsmParser();
+
     binop_precedence['<'] = 10;
     binop_precedence['+'] = 20;
     binop_precedence['-'] = 20;
@@ -596,11 +668,11 @@ int main()
     fprintf(stderr, "ready> ");
     get_next_token();
 
-    initialize_module();
+
+    the_jit = exit_on_error(KaleidoscopeJIT::Create());
+    initialize_module_and_pass_manager();
 
     main_loop();
-
-    the_module->print(errs(), nullptr);
 
     return 0;
 }
