@@ -388,8 +388,7 @@ static std::unique_ptr<ExprAST> parse_for_expr()
     if (!body)
         return nullptr;
 
-    return std::make_unique<ForExprAST>(id_name, std::move(start), std::move(end),
-                                        std::move(step), std::move(body));
+    return std::make_unique<ForExprAST>(id_name, std::move(start), std::move(end), std::move(step), std::move(body));
 }
 
 static std::unique_ptr<ExprAST> parse_primary() 
