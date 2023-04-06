@@ -18,3 +18,5 @@ $ clang++ -g -O3 [source file] `/usr/lib/llvm-15/bin/llvm-config --cxxflags --ld
 - 2023-04-03 / Chapter 6
 - 2023-04-04 / Chapter 7
 - 2023-04-04 / Chapter 8
+- 2023-04-06 / Chapter 9
+- 2023-04-06 / End!
